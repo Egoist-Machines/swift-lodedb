@@ -3,7 +3,7 @@ import LodeDBCoreFFI
 
 /// The C ABI version this binding is built against. Checked at engine creation so a
 /// mismatched XCFramework fails loudly instead of corrupting memory.
-let lodeNativeExpectedABIVersion: UInt32 = 1
+let lodeNativeExpectedABIVersion: UInt32 = 4
 
 /// Owning wrapper around a native `LodeEngine *`, statically linked from the
 /// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
@@ -32,7 +32,8 @@ final class NativeEngine {
         vectorDimension: Int,
         bitWidth: Int = 4,
         indexID: String = "default",
-        model: String? = nil
+        model: String? = nil,
+        ann: LodeAnnOptions? = nil
     ) throws -> NativeEngine {
         try requireABI()
         var engine: OpaquePointer?
@@ -42,7 +43,7 @@ final class NativeEngine {
             throw LodeDBError.internalError("native core did not return an engine")
         }
         let native = NativeEngine(handle: engine, indexID: indexID)
-        try native.createIndex(vectorDimension: vectorDimension, bitWidth: bitWidth, model: model)
+        try native.createIndex(vectorDimension: vectorDimension, bitWidth: bitWidth, model: model, ann: ann)
         return native
     }
 
@@ -74,20 +75,29 @@ final class NativeEngine {
 
     /// Creates the index. When `model` is non-nil the index is bound to that model
     /// identity (for the reopen-time embedder guard); otherwise native defaults apply.
-    func createIndex(vectorDimension: Int, bitWidth: Int = 4, model: String? = nil) throws {
+    /// When `ann` is set the index opts into approximate-nearest-neighbor scanning.
+    func createIndex(
+        vectorDimension: Int,
+        bitWidth: Int = 4,
+        model: String? = nil,
+        ann: LodeAnnOptions? = nil
+    ) throws {
+        // Single create path through the JSON ABI: send only the distinguishing
+        // fields and let the core supply the identity defaults, so exact and ANN
+        // indexes share one path and we never hand-copy native_default's literals.
+        // A nil model/ann is omitted by the encoder (exact index sends no ann key).
+        let request = CreateIndexRequestJSON(
+            index_id: indexID,
+            vector_dim: vectorDimension,
+            bit_width: bitWidth,
+            model: model,
+            ann: ann.map {
+                CoreAnnOptionsJSON(algorithm: $0.algorithm, clusters: $0.clusters, nprobe: $0.nprobe)
+            })
+        let requestJSON = try encodeJSON(request)
         var error: UnsafeMutablePointer<LodeError>?
-        let status: UInt32
-        if let model {
-            status = withStringView(indexID) { indexView in
-                withStringView(model) { modelView in
-                    lodedb_engine_create_index_with_model(
-                        handle, indexView, UInt(vectorDimension), UInt(bitWidth), modelView, &error)
-                }
-            }
-        } else {
-            status = withStringView(indexID) { indexView in
-                lodedb_engine_create_index(handle, indexView, UInt(vectorDimension), UInt(bitWidth), &error)
-            }
+        let status = withStringView(requestJSON) {
+            lodedb_engine_create_index_json(handle, $0, &error)
         }
         try Self.check(status, error: error)
     }
@@ -384,6 +394,21 @@ final class NativeEngine {
         try Self.check(lodedb_engine_persist(handle, &error), error: error)
     }
 
+    func refresh() throws {
+        var error: UnsafeMutablePointer<LodeError>?
+        try Self.check(lodedb_engine_refresh(handle, &error), error: error)
+    }
+
+    func appliedLSN() throws -> UInt64 {
+        var lsn: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(indexID) {
+            lodedb_engine_applied_lsn(handle, $0, &lsn, &error)
+        }
+        try Self.check(status, error: error)
+        return lsn
+    }
+
     func close() throws {
         var error: UnsafeMutablePointer<LodeError>?
         try Self.check(lodedb_engine_close(handle, &error), error: error)
@@ -391,7 +416,7 @@ final class NativeEngine {
 
     // MARK: - Helpers
 
-    private static func requireABI() throws {
+    fileprivate static func requireABI() throws {
         let abi = lodedb_abi_version()
         guard abi == lodeNativeExpectedABIVersion else {
             throw LodeDBError.corruptStore(
@@ -412,7 +437,7 @@ final class NativeEngine {
         return try Self.copyOwnedString(out)
     }
 
-    private static func check(_ status: UInt32, error: UnsafeMutablePointer<LodeError>?) throws {
+    fileprivate static func check(_ status: UInt32, error: UnsafeMutablePointer<LodeError>?) throws {
         guard status != 0 else { return }
         defer { lodedb_error_free(error) }
         let message = error?.pointee.message.map { String(cString: $0) } ?? "native core call failed"
@@ -426,7 +451,7 @@ final class NativeEngine {
         }
     }
 
-    private static func copyOwnedString(_ out: UnsafeMutablePointer<LodeOwnedString>?) throws -> String {
+    fileprivate static func copyOwnedString(_ out: UnsafeMutablePointer<LodeOwnedString>?) throws -> String {
         guard let out else {
             throw LodeDBError.internalError("native core did not return JSON")
         }
@@ -444,6 +469,149 @@ final class NativeEngine {
         }
         return text
     }
+}
+
+/// Owning wrapper around a native `LodeAppender *`, statically linked from the
+/// `LodeDBCoreFFI` XCFramework (no `dlopen`). Not thread-safe; callers serialize
+/// access (see `LodeAppender`).
+final class NativeAppender {
+    private let handle: OpaquePointer
+
+    private init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        lodedb_appender_free(handle)
+    }
+
+    /// Opens a shared-lock appender over the single index at the store described by
+    /// a `CoreOpenOptions` JSON document (WAL commit mode).
+    static func open(optionsJSON: String) throws -> NativeAppender {
+        try NativeEngine.requireABI()
+        var appender: OpaquePointer?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(optionsJSON) { lodedb_appender_open_json($0, &appender, &error) }
+        try NativeEngine.check(status, error: error)
+        guard let appender else {
+            throw LodeDBError.internalError("native core did not return an appender")
+        }
+        return NativeAppender(handle: appender)
+    }
+
+    /// Durably logs one `upsert_vectors` record and returns its assigned LSN.
+    func appendVectorsJSON(_ documentsJSON: String) throws -> UInt64 {
+        var lsn: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(documentsJSON) {
+            lodedb_appender_append_vectors_json(handle, $0, &lsn, &error)
+        }
+        try NativeEngine.check(status, error: error)
+        return lsn
+    }
+
+    /// Durably logs one `delete_documents` record and returns its assigned LSN.
+    func appendDeletesJSON(_ documentIDsJSON: String) throws -> UInt64 {
+        var lsn: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(documentIDsJSON) {
+            lodedb_appender_append_deletes_json(handle, $0, &lsn, &error)
+        }
+        try NativeEngine.check(status, error: error)
+        return lsn
+    }
+
+    /// Chunks a `CoreDocument` JSON array into an `IngestPlan` JSON the caller embeds
+    /// before calling `appendEmbeddedDocumentsJSON`.
+    func prepareDocumentsJSON(_ documentsJSON: String) throws -> String {
+        var out: UnsafeMutablePointer<LodeOwnedString>?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(documentsJSON) {
+            lodedb_appender_prepare_documents_json(handle, $0, &out, &error)
+        }
+        try NativeEngine.check(status, error: error)
+        return try NativeEngine.copyOwnedString(out)
+    }
+
+    /// Durably logs one `apply_embedded_documents` record from an `IngestPlan` JSON
+    /// (from `prepareDocumentsJSON`) and its per-chunk embeddings JSON, returning the
+    /// assigned LSN.
+    func appendEmbeddedDocumentsJSON(planJSON: String, embeddingsJSON: String) throws -> UInt64 {
+        var lsn: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(planJSON) { planView in
+            withStringView(embeddingsJSON) { embeddingsView in
+                lodedb_appender_append_embedded_documents_json(
+                    handle, planView, embeddingsView, &lsn, &error)
+            }
+        }
+        try NativeEngine.check(status, error: error)
+        return lsn
+    }
+}
+
+/// Owning wrapper around a native `LodeCheckpointer *`, statically linked from the
+/// `LodeDBCoreFFI` XCFramework (no `dlopen`). Holds the checkpointer lease for its
+/// lifetime; `deinit` releases it. Not thread-safe; callers serialize access (see
+/// `LodeCheckpointer`).
+final class NativeCheckpointer {
+    private let handle: OpaquePointer
+
+    private init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        lodedb_checkpointer_free(handle)
+    }
+
+    /// Opens a running single-checkpointer over the single index at the store
+    /// described by a `CoreOpenOptions` JSON document (writable, WAL commit mode),
+    /// acquiring the lease.
+    static func open(optionsJSON: String) throws -> NativeCheckpointer {
+        try NativeEngine.requireABI()
+        var checkpointer: OpaquePointer?
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = withStringView(optionsJSON) {
+            lodedb_checkpointer_open_json($0, &checkpointer, &error)
+        }
+        try NativeEngine.check(status, error: error)
+        guard let checkpointer else {
+            throw LodeDBError.internalError("native core did not return a checkpointer")
+        }
+        return NativeCheckpointer(handle: checkpointer)
+    }
+
+    /// Folds the appended WAL tail into a fresh committed generation under a brief hold
+    /// of the exclusive writer lock, returning the number of records folded.
+    func checkpoint() throws -> UInt64 {
+        var folded: UInt64 = 0
+        var error: UnsafeMutablePointer<LodeError>?
+        let status = lodedb_checkpointer_checkpoint(handle, &folded, &error)
+        try NativeEngine.check(status, error: error)
+        return folded
+    }
+}
+
+/// Serde-shaped payload for `lodedb_engine_create_index_json` — a minimal
+/// `CoreIndexCreateRequest`. Only the distinguishing fields cross the boundary; the
+/// core supplies the identity defaults (name, provider, task, route/storage
+/// profile, and index_key/client_id_hash from index_id). `nil` optionals (`model`,
+/// `ann`) are omitted by the encoder, so an exact index sends no `ann` key.
+private struct CreateIndexRequestJSON: Encodable {
+    let index_id: String
+    let vector_dim: Int
+    let bit_width: Int
+    let model: String?
+    let ann: CoreAnnOptionsJSON?
+}
+
+/// Serde-shaped payload for `CoreAnnOptions`; unset tuning is omitted so the core
+/// applies its corpus-derived defaults.
+private struct CoreAnnOptionsJSON: Encodable {
+    let algorithm: String
+    let clusters: Int?
+    let nprobe: Int?
 }
 
 func withStringView<T>(_ string: String, _ body: (LodeStringView) throws -> T) rethrows -> T {
