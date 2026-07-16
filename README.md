@@ -5,10 +5,10 @@ Rust core. This is the published SwiftPM distribution: a thin package whose bina
 target is the `LodeDBCoreFFI.xcframework` from the corresponding LodeDB release.
 
 ```swift
-.package(url: "https://github.com/Egoist-Machines/swift-lodedb", from: "1.3.1")
+.package(url: "https://github.com/Egoist-Machines/swift-lodedb", from: "1.3.2")
 ```
 
 Sources, tests, issues, and docs live in the main repository:
 https://github.com/Egoist-Machines/LodeDB (see `swift/LodeDBCore/README.md` and
-`docs/swift-agent-contract.md`). This package is generated from LodeDB 1.3.1;
+`docs/swift-agent-contract.md`). This package is generated from LodeDB 1.3.2;
 do not edit it here.
